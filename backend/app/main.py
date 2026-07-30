@@ -43,14 +43,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("启动时连接 Redis 失败", exc_info=True)
 
-    # 初始化 Chroma collection（同步，放入线程）
+    # 初始化 Chroma collection（同步，放入线程；加超时避免首次下载模型卡死启动）
     try:
         import asyncio
 
         from app.core.chroma_client import get_chroma_collection
 
-        await asyncio.to_thread(get_chroma_collection)
+        # 首次启动 Chroma 会下载默认 embedding 模型（约 90MB），
+        # 网络慢时可能阻塞很久，这里加 60 秒超时，失败不阻塞后端启动。
+        await asyncio.wait_for(asyncio.to_thread(get_chroma_collection), timeout=60)
         logger.info("Chroma collection 已就绪")
+    except asyncio.TimeoutError:
+        logger.warning("初始化 Chroma 超时（可能正在后台下载模型），将延迟到首次调用时重试")
     except Exception:
         logger.warning("启动时初始化 Chroma 失败", exc_info=True)
 
