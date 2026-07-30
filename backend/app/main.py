@@ -5,11 +5,14 @@
 - 配置 CORS
 - 挂载 v1 路由（前缀 /api/v1）
 - 启动时初始化数据库表与 Chroma collection
-- 关闭时释放 Redis 连接
 - 健康检查接口
+
+说明：Redis 为可选项，仅在使用 Celery 异步索引任务时需要。
+默认配置下商品索引通过 rag_service 直接异步同步，无需 Redis。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -17,9 +20,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import router as v1_router
+from app.core.chroma_client import get_chroma_collection
 from app.core.config import settings
 from app.core.database import init_db
-from app.core.redis_client import close_redis, get_redis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,19 +39,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("启动时创建数据库表失败（可能是数据库尚未就绪）", exc_info=True)
 
-    try:
-        # 初始化 Redis 连接（懒加载触发）
-        await get_redis()
-        logger.info("Redis 已连接")
-    except Exception:
-        logger.warning("启动时连接 Redis 失败", exc_info=True)
-
     # 初始化 Chroma collection（同步，放入线程；加超时避免首次下载模型卡死启动）
     try:
-        import asyncio
-
-        from app.core.chroma_client import get_chroma_collection
-
         # 首次启动 Chroma 会下载默认 embedding 模型（约 90MB），
         # 网络慢时可能阻塞很久，这里加 60 秒超时，失败不阻塞后端启动。
         await asyncio.wait_for(asyncio.to_thread(get_chroma_collection), timeout=60)
@@ -62,8 +54,6 @@ async def lifespan(app: FastAPI):
 
     # ---- 关闭 ----
     logger.info("AI Mall 关闭中...")
-    await close_redis()
-    logger.info("已关闭 Redis 连接")
 
 
 app = FastAPI(

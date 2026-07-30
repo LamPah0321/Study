@@ -1,12 +1,14 @@
 """商品业务服务层。
 
-封装对 Product 表的 CRUD，并在写操作后触发 Celery 索引任务，
+封装对 Product 表的 CRUD，并在写操作后同步向量索引到 Chroma，
 保持 MySQL 与 Chroma 向量库的一致性。
 
-为避免循环导入，Celery task 采用函数内懒加载导入。
+索引同步采用直接异步调用 rag_service（无需 Redis/Celery）。
+若部署了 Redis + Celery，也可改用 tasks.indexing.update_product_index.delay 异步派发。
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional, Sequence
 
 from sqlalchemy import select
@@ -14,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.product import Product
 from app.schemas.product import ProductCreate, ProductUpdate
+
+logger = logging.getLogger(__name__)
 
 
 async def list_products(
@@ -37,13 +41,13 @@ async def get_product(session: AsyncSession, pid: int) -> Optional[Product]:
 
 
 async def create_product(session: AsyncSession, data: ProductCreate) -> Product:
-    """创建商品，并触发向量化索引任务。"""
+    """创建商品，并同步向量索引。"""
     product = Product(**data.model_dump())
     session.add(product)
     await session.commit()
     await session.refresh(product)
 
-    _trigger_index(product.id, "upsert")
+    await _sync_index(product, "upsert")
     return product
 
 
@@ -60,7 +64,7 @@ async def update_product(session: AsyncSession, pid: int, data: ProductUpdate) -
     await session.commit()
     await session.refresh(product)
 
-    _trigger_index(product.id, "upsert")
+    await _sync_index(product, "upsert")
     return product
 
 
@@ -73,21 +77,28 @@ async def delete_product(session: AsyncSession, pid: int) -> bool:
     await session.delete(product)
     await session.commit()
 
-    _trigger_index(pid, "delete")
+    await _sync_index(product, "delete")
     return True
 
 
-def _trigger_index(product_id: int, action: str) -> None:
-    """触发 Celery 索引任务（懒导入，避免循环依赖与无 broker 时硬失败）。"""
+async def _sync_index(product: Product, action: str) -> None:
+    """直接调用 rag_service 同步向量索引（无需 Redis/Celery）。
+
+    失败时仅记录日志，不影响主业务流程（DB 写入已成功）。
+    """
     try:
-        from app.tasks.indexing import update_product_index
+        from app.services import rag_service
 
-        update_product_index.delay(product_id, action)
+        if action == "delete":
+            await rag_service.delete_product_embedding(product.id)
+        else:
+            text = f"{product.name or ''} {product.category or ''} {product.description or ''}".strip()
+            if text:
+                await rag_service.upsert_product_embedding(product.id, text)
     except Exception:
-        # 任务派发失败不应影响主流程（例如无 Redis 时仍保证 DB 写入成功）
-        # 生产环境可改为日志记录告警
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "派发索引任务失败 product_id=%s action=%s", product_id, action, exc_info=True
+        logger.warning(
+            "同步向量索引失败 product_id=%s action=%s（不影响 DB 写入）",
+            getattr(product, "id", "?"),
+            action,
+            exc_info=True,
         )
