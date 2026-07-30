@@ -1,6 +1,8 @@
 import axios from 'axios'
 
-const BASE_URL = 'http://localhost:8000/api/v1'
+// 使用相对路径，开发环境通过 Vite 代理转发到后端（见 vite.config.js），
+// 可彻底避免 CORS / 127.0.0.1 与 localhost 不一致的跨域问题。
+const BASE_URL = '/api/v1'
 
 const api = axios.create({
   baseURL: BASE_URL,
